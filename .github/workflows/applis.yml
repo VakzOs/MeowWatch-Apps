@@ -1,0 +1,189 @@
+# Construit les applis Meow Watch (Android, Apple TV, iPhone) à partir du dépôt privé VakzOs/MeowWatch et publie les
+# fichiers ici. Ce dépôt est public pour que les constructions soient gratuites ; il ne contient pas de code : le code
+# est lu au moment de construire avec le secret SOURCE_TOKEN (lecture seule sur MeowWatch).
+# Déclenché par MeowWatch (repository_dispatch « applis », jeton APPS_TOKEN), toutes les 30 min, ou à la main :
+#   ref   : branche ou commit de MeowWatch (main par défaut)
+#   essai : "true" = essais dans les simulateurs Apple TV et iPhone, sans publication
+# Publication : si la version de tv/app.json n'a pas encore de Release android-vX.Y.Z / tvos-vX.Y.Z ici.
+name: Applis
+
+on:
+  repository_dispatch:
+    types: [applis]
+  # Filet de sécurité gratuit : toutes les 30 min, publication si main a une nouvelle version (le dépôt privé peut
+  # manquer de minutes pour prévenir).
+  schedule:
+    - cron: "17,47 * * * *"
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Branche ou commit de MeowWatch
+        default: main
+      essai:
+        description: Essais dans les simulateurs, sans publication
+        type: boolean
+        default: false
+
+concurrency:
+  group: applis-${{ github.event.client_payload.branch || inputs.ref || 'main' }}
+  cancel-in-progress: true
+
+env:
+  REF: ${{ github.event.client_payload.ref || inputs.ref || 'main' }}
+  ESSAI: ${{ github.event.client_payload.essai || inputs.essai || false }}
+  EXPO_PUBLIC_API_URL: https://meowwatch.vkzdev.com
+
+jobs:
+  version:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+      android: ${{ steps.v.outputs.android }}
+      apple: ${{ steps.v.outputs.apple }}
+      essai: ${{ steps.v.outputs.essai }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          repository: VakzOs/MeowWatch
+          ref: ${{ env.REF }}
+          token: ${{ secrets.SOURCE_TOKEN }}
+          sparse-checkout: tv/app.json
+      - id: v
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          v=$(jq -r .expo.version tv/app.json); echo "version=$v" >> "$GITHUB_OUTPUT"
+          new() { gh release view "$1" --repo "$GITHUB_REPOSITORY" > /dev/null 2>&1 && echo false || echo true; }
+          if [ "$ESSAI" = "true" ]; then echo "essai=true" >> "$GITHUB_OUTPUT"; echo "android=false" >> "$GITHUB_OUTPUT"; echo "apple=false" >> "$GITHUB_OUTPUT"
+          else echo "essai=false" >> "$GITHUB_OUTPUT"; echo "android=$(new android-v$v)" >> "$GITHUB_OUTPUT"; echo "apple=$(new tvos-v$v)" >> "$GITHUB_OUTPUT"; fi
+
+  # Android (télé et téléphone), signé avec la clé de l'appli : toujours la même, sinon Android refuse d'installer la
+  # nouvelle version par-dessus l'ancienne.
+  android:
+    needs: version
+    if: needs.version.outputs.android == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    defaults:
+      run:
+        working-directory: tv
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          repository: VakzOs/MeowWatch
+          ref: ${{ env.REF }}
+          token: ${{ secrets.SOURCE_TOKEN }}
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+      - uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: 21
+      - uses: gradle/actions/setup-gradle@v5
+      - run: npm ci
+      - run: npm run prebuild
+      - name: APK
+        env:
+          ANDROID_KEYSTORE: ${{ secrets.ANDROID_KEYSTORE }}
+          MW_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+        run: |
+          # Toujours plus grand que les versions publiées depuis MeowWatch (jusqu'à 32) : Android refuse de revenir en arrière.
+          export MW_VERSION_CODE=$((GITHUB_RUN_NUMBER + 100))
+          if [ -z "$ANDROID_KEYSTORE" ]; then echo "::error::Secret ANDROID_KEYSTORE manquant"; exit 1; fi
+          echo "$ANDROID_KEYSTORE" | base64 -d > "$RUNNER_TEMP/meowwatch.jks"; export MW_KEYSTORE="$RUNNER_TEMP/meowwatch.jks"
+          cd android && ./gradlew assembleRelease --no-daemon -q
+          cp app/build/outputs/apk/release/app-release.apk ../Meow-Watch-TV.apk
+      - name: Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: android-v${{ needs.version.outputs.version }}
+        run: |
+          gh release create "$TAG" Meow-Watch-TV.apk --repo "$GITHUB_REPOSITORY" --title "Meow Watch pour Android ${TAG#android-v}" \
+            --notes "Télé Android et téléphone : meowwatch.vkzdev.com/tv.apk donne toujours la dernière version."
+
+  # Apple TV et iPhone, sans signature : Vakz les signe avec Signulous. iPhone = le même projet sans le plugin TV.
+  apple:
+    needs: version
+    if: needs.version.outputs.apple == 'true' || needs.version.outputs.essai == 'true'
+    strategy:
+      matrix:
+        include:
+          - { name: AppleTV, tv: "1", sdk: appletvos, sim: appletvsimulator, dest: tvOS }
+          - { name: iPhone, tv: "0", sdk: iphoneos, sim: iphonesimulator, dest: iOS }
+    runs-on: macos-26
+    defaults:
+      run:
+        working-directory: tv
+    env:
+      EXPO_TV: ${{ matrix.tv }}
+      MW_IPHONE: ${{ matrix.tv == '0' && '1' || '' }}
+      # Construction d'essai : le lecteur s'ouvre sans compte et lit ce MKV de test (plusieurs pistes audio et sous-titres).
+      EXPO_PUBLIC_ESSAI_LECTEUR: ${{ needs.version.outputs.essai == 'true' && 'https://raw.githubusercontent.com/ietf-wg-cellar/matroska-test-files/master/test_files/test5.mkv' || '' }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          repository: VakzOs/MeowWatch
+          ref: ${{ env.REF }}
+          token: ${{ secrets.SOURCE_TOKEN }}
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+      - run: npm ci
+      - run: npx expo prebuild --platform ios --clean > /dev/null
+      - name: IPA sans signature
+        if: needs.version.outputs.essai != 'true'
+        run: |
+          cd ios
+          xcodebuild -workspace MeowWatch.xcworkspace -scheme MeowWatch -configuration Release -sdk ${{ matrix.sdk }} -destination generic/platform=${{ matrix.dest }} \
+            -derivedDataPath build CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" -quiet build
+          mkdir Payload && cp -R build/Build/Products/Release-${{ matrix.sdk }}/MeowWatch.app Payload/
+          zip -qry ../Meow-Watch-${{ matrix.name }}.ipa Payload
+      - uses: actions/upload-artifact@v4
+        if: needs.version.outputs.essai != 'true'
+        with:
+          name: Meow-Watch-${{ matrix.name }}
+          path: tv/Meow-Watch-${{ matrix.name }}.ipa
+      - name: Essai dans le simulateur
+        if: needs.version.outputs.essai == 'true'
+        run: |
+          cd ios
+          xcodebuild -workspace MeowWatch.xcworkspace -scheme MeowWatch -configuration Release -sdk ${{ matrix.sim }} -destination "generic/platform=${{ matrix.dest }} Simulator" \
+            -derivedDataPath build CODE_SIGNING_ALLOWED=NO -quiet build
+          cd .. && mkdir -p captures
+          if [ "${{ matrix.tv }}" = "1" ]; then pat='tvOS'; name='4K'; else pat='iOS'; name='^iPhone [0-9]+ Pro$'; fi
+          dev=$(xcrun simctl list devices available -j | jq -r --arg p "$pat" --arg n "$name" '[.devices | to_entries[] | select(.key | test($p)) | .value[] | select(.name | test($n))][-1].udid')
+          xcrun simctl boot "$dev"; xcrun simctl bootstatus "$dev"
+          open -a Simulator; sleep 5
+          xcrun simctl install "$dev" ios/build/Build/Products/Release-${{ matrix.sim }}/MeowWatch.app
+          shot() { xcrun simctl io "$dev" screenshot "captures/$1.png"; }
+          key() { osascript -e 'tell application "Simulator" to activate' -e "tell application \"System Events\" to key code $1" || true; sleep 2; }
+          # La construction d'essai ouvre le lecteur 3 s après le lancement.
+          xcrun simctl launch "$dev" com.vkzdev.meowwatch.tv; sleep 3; shot accueil
+          for t in 15 30; do sleep 13; shot "lecture-${t}s"; done
+          key 36; shot commandes
+          xcrun simctl spawn "$dev" log show --last 3m --predicate 'process == "MeowWatch"' --style compact | grep -iE "error|exception" | tail -n 20 || true
+      - uses: actions/upload-artifact@v4
+        if: always() && needs.version.outputs.essai == 'true'
+        with:
+          name: captures-${{ matrix.name }}
+          path: tv/captures
+
+  release-apple:
+    needs: [version, apple]
+    if: needs.version.outputs.apple == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: Meow-Watch-*
+          merge-multiple: true
+      - env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: tvos-v${{ needs.version.outputs.version }}
+        run: |
+          gh release create "$TAG" Meow-Watch-AppleTV.ipa Meow-Watch-iPhone.ipa --repo "$GITHUB_REPOSITORY" --title "Meow Watch pour Apple TV et iPhone ${TAG#tvos-v}" \
+            --notes "Fichiers non signés, à signer avec Signulous : meowwatch.vkzdev.com/tv.ipa (Apple TV) et meowwatch.vkzdev.com/iphone.ipa (iPhone)."
