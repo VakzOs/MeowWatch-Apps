@@ -1,10 +1,11 @@
-# Construit les applis Meow Watch (Android, Apple TV, iPhone) à partir du dépôt privé VakzOs/MeowWatch et publie les
+# Construit les applis Meow Watch (Android, Apple TV, iPhone, Windows) à partir du dépôt privé VakzOs/MeowWatch et publie les
 # fichiers ici. Ce dépôt est public pour que les constructions soient gratuites ; il ne contient pas de code : le code
 # est lu au moment de construire avec le secret SOURCE_TOKEN (lecture seule sur MeowWatch).
 # Déclenché par MeowWatch (repository_dispatch « applis », jeton APPS_TOKEN), toutes les 30 min, ou à la main :
 #   ref   : branche ou commit de MeowWatch (main par défaut)
 #   essai : "true" = essais dans les simulateurs Apple TV et iPhone, sans publication
-# Publication : si la version de tv/app.json n'a pas encore de Release android-vX.Y.Z / tvos-vX.Y.Z ici.
+# Publication : si la version de tv/app.json n'a pas encore de Release android-vX.Y.Z / tvos-vX.Y.Z ici, ou celle de
+# desktop/src-tauri/tauri.conf.json de Release windows-vX.Y.Z (mises à jour signées : secret TAURI_SIGNING_PRIVATE_KEY).
 name: Applis
 
 on:
@@ -41,21 +42,29 @@ jobs:
       android: ${{ steps.v.outputs.android }}
       apple: ${{ steps.v.outputs.apple }}
       essai: ${{ steps.v.outputs.essai }}
+      windows: ${{ steps.v.outputs.windows }}
     steps:
       - uses: actions/checkout@v5
         with:
           repository: VakzOs/MeowWatch
           ref: ${{ env.REF }}
           token: ${{ secrets.SOURCE_TOKEN }}
-          sparse-checkout: tv/app.json
+          sparse-checkout: |
+            tv/app.json
+            desktop/src-tauri/tauri.conf.json
       - id: v
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAURI_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY != '' }}
         run: |
           v=$(jq -r .expo.version tv/app.json); echo "version=$v" >> "$GITHUB_OUTPUT"
+          w=$(jq -r .version desktop/src-tauri/tauri.conf.json)
           new() { gh release view "$1" --repo "$GITHUB_REPOSITORY" > /dev/null 2>&1 && echo false || echo true; }
           if [ "$ESSAI" = "true" ]; then echo "essai=true" >> "$GITHUB_OUTPUT"; echo "android=false" >> "$GITHUB_OUTPUT"; echo "apple=false" >> "$GITHUB_OUTPUT"
           else echo "essai=false" >> "$GITHUB_OUTPUT"; echo "android=$(new android-v$v)" >> "$GITHUB_OUTPUT"; echo "apple=$(new tvos-v$v)" >> "$GITHUB_OUTPUT"; fi
+          # Windows : jamais sans la clé, sinon l'appli installée refuserait la mise à jour.
+          if [ "$ESSAI" != "true" ] && [ "$TAURI_KEY" = "true" ]; then echo "windows=$(new windows-v$w)" >> "$GITHUB_OUTPUT"
+          else echo "windows=false" >> "$GITHUB_OUTPUT"; [ "$TAURI_KEY" = "true" ] || echo "::warning::Secret TAURI_SIGNING_PRIVATE_KEY manquant : appli Windows non construite"; fi
 
   # Android (télé et téléphone), signé avec la clé de l'appli : toujours la même, sinon Android refuse d'installer la
   # nouvelle version par-dessus l'ancienne.
@@ -187,3 +196,68 @@ jobs:
         run: |
           gh release create "$TAG" Meow-Watch-AppleTV.ipa Meow-Watch-iPhone.ipa --repo "$GITHUB_REPOSITORY" --title "Meow Watch pour Apple TV et iPhone ${TAG#tvos-v}" \
             --notes "Fichiers non signés, à signer avec Signulous : meowwatch.vkzdev.com/tv.ipa (Apple TV) et meowwatch.vkzdev.com/iphone.ipa (iPhone)."
+
+  # Windows : installateur NSIS, mise à jour signée et latest.json (lu par le site, /latest.json), puis l'installateur
+  # au design de Meow Watch.
+  windows:
+    needs: version
+    if: needs.version.outputs.windows == 'true'
+    runs-on: windows-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          repository: VakzOs/MeowWatch
+          ref: ${{ env.REF }}
+          token: ${{ secrets.SOURCE_TOKEN }}
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            desktop/src-tauri -> target
+            desktop/setup/src-tauri -> target
+      - run: npm ci
+        working-directory: desktop
+      # Lecteur mpv : libmpv (build LGPL de zhongfly, la plus récente) et la petite DLL qui fait le lien avec le plugin.
+      - name: Bibliothèques mpv
+        shell: pwsh
+        run: |
+          $lib = "desktop/src-tauri/lib"; New-Item -ItemType Directory -Force $lib | Out-Null
+          $mpv = "https://github.com/zhongfly/mpv-winbuild/releases/latest/download"
+          Invoke-WebRequest "$mpv/sha256.txt" -OutFile sha256.txt
+          $name = ((Get-Content sha256.txt | Where-Object { $_ -match "mpv-dev-lgpl-x86_64-" -and $_ -notmatch "v3" } | Select-Object -First 1).Trim() -split "\s+")[-1]
+          Invoke-WebRequest "$mpv/$name" -OutFile mpv.7z
+          7z e mpv.7z libmpv-2.dll -o"$lib" -y | Out-Null
+          Invoke-WebRequest "https://github.com/nini22P/libmpv-wrapper/releases/latest/download/libmpv-wrapper-windows-x86_64.zip" -OutFile wrapper.zip
+          Expand-Archive wrapper.zip -DestinationPath wrapper -Force
+          Get-ChildItem wrapper -Recurse -Filter libmpv-wrapper.dll | Select-Object -First 1 | Copy-Item -Destination $lib
+          if (-not (Test-Path "$lib/libmpv-2.dll") -or -not (Test-Path "$lib/libmpv-wrapper.dll")) { throw "DLL de mpv manquantes" }
+      - uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ""
+        with:
+          projectPath: desktop
+          tagName: windows-v__VERSION__
+          releaseName: Meow Watch pour Windows __VERSION__
+          releaseBody: "Télécharge « Installer-Meow-Watch.exe » (ou meowwatch.vkzdev.com/windows.exe) et lance-le. Si Meow Watch est déjà installé, il se met à jour tout seul."
+          releaseDraft: false
+          prerelease: false
+      - name: Installateur Meow Watch
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          $nsis = Get-ChildItem desktop/src-tauri/target/release/bundle/nsis/*-setup.exe | Select-Object -First 1
+          $env:MW_SETUP = $nsis.FullName
+          $version = (Get-Content desktop/src-tauri/tauri.conf.json -Raw | ConvertFrom-Json).version
+          Push-Location desktop/setup
+          npx tauri build --no-bundle
+          Pop-Location
+          Copy-Item desktop/setup/src-tauri/target/release/meow-watch-setup.exe Installer-Meow-Watch.exe
+          gh release upload "windows-v$version" Installer-Meow-Watch.exe --clobber --repo ${{ github.repository }}
