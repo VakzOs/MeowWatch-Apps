@@ -1,7 +1,7 @@
 # Construit les applis Meow Watch (Android, Apple TV, iPhone, Windows) à partir du dépôt privé VakzOs/MeowWatch et publie les
 # fichiers ici. Ce dépôt est public pour que les constructions soient gratuites ; il ne contient pas de code : le code
 # est lu au moment de construire avec le secret SOURCE_TOKEN (lecture seule sur MeowWatch).
-# Déclenché par MeowWatch (repository_dispatch « applis », jeton APPS_TOKEN), toutes les 30 min, ou à la main :
+# Déclenché par MeowWatch (repository_dispatch « applis », jeton APPS_TOKEN), toutes les 5 min, ou à la main :
 #   ref   : branche ou commit de MeowWatch (main par défaut)
 #   essai : "true" = essais dans les simulateurs Apple TV et iPhone, sans publication
 # Publication : si la version de tv/app.json n'a pas encore de Release android-vX.Y.Z / tvos-vX.Y.Z ici, ou celle de
@@ -11,10 +11,10 @@ name: Applis
 on:
   repository_dispatch:
     types: [applis]
-  # Filet de sécurité gratuit : toutes les 30 min, publication si main a une nouvelle version (le dépôt privé peut
-  # manquer de minutes pour prévenir).
+  # Filet de sécurité gratuit : toutes les 5 min (le minimum de GitHub, parfois retardé quand il est chargé),
+  # publication si main a une nouvelle version (le dépôt privé peut manquer de minutes pour prévenir).
   schedule:
-    - cron: "17,47 * * * *"
+    - cron: "*/5 * * * *"
   workflow_dispatch:
     inputs:
       ref:
@@ -25,9 +25,11 @@ on:
         type: boolean
         default: false
 
+# Un nouvel envoi annule la construction en cours de la même branche ; la vérification planifiée, elle, attend son tour
+# (toutes les 5 min, elle annulerait sinon chaque construction, qui dure bien plus longtemps).
 concurrency:
   group: applis-${{ github.event.client_payload.branch || inputs.ref || 'main' }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.event_name != 'schedule' }}
 
 env:
   REF: ${{ github.event.client_payload.ref || inputs.ref || 'main' }}
