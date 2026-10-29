@@ -24,11 +24,15 @@ on:
         description: Essais dans les simulateurs, sans publication
         type: boolean
         default: false
+      beta:
+        description: Apple TV bêta (lecteur mpv) seulement, Release « tvos-beta »
+        type: boolean
+        default: false
 
 # Un nouvel envoi annule la construction en cours de la même branche ; la vérification planifiée, elle, attend son tour
 # (toutes les 5 min, elle annulerait sinon chaque construction, qui dure bien plus longtemps).
 concurrency:
-  group: applis-${{ github.event.client_payload.branch || inputs.ref || 'main' }}
+  group: applis-${{ inputs.beta && 'beta-' || '' }}${{ github.event.client_payload.branch || inputs.ref || 'main' }}
   cancel-in-progress: ${{ github.event_name != 'schedule' }}
 
 env:
@@ -45,6 +49,7 @@ jobs:
       apple: ${{ steps.v.outputs.apple }}
       essai: ${{ steps.v.outputs.essai }}
       windows: ${{ steps.v.outputs.windows }}
+      beta: ${{ steps.v.outputs.beta }}
     steps:
       - uses: actions/checkout@v5
         with:
@@ -62,6 +67,9 @@ jobs:
           v=$(jq -r .expo.version tv/app.json); echo "version=$v" >> "$GITHUB_OUTPUT"
           w=$(jq -r .version desktop/src-tauri/tauri.conf.json)
           new() { gh release view "$1" --repo "$GITHUB_REPOSITORY" > /dev/null 2>&1 && echo false || echo true; }
+          # Bêta Apple TV : rien d'autre n'est construit.
+          if [ "${{ inputs.beta }}" = "true" ]; then echo "beta=true" >> "$GITHUB_OUTPUT"; echo "essai=false" >> "$GITHUB_OUTPUT"; echo "android=false" >> "$GITHUB_OUTPUT"; echo "apple=false" >> "$GITHUB_OUTPUT"; echo "windows=false" >> "$GITHUB_OUTPUT"; exit 0; fi
+          echo "beta=false" >> "$GITHUB_OUTPUT"
           if [ "$ESSAI" = "true" ]; then echo "essai=true" >> "$GITHUB_OUTPUT"; echo "android=false" >> "$GITHUB_OUTPUT"; echo "apple=false" >> "$GITHUB_OUTPUT"
           else echo "essai=false" >> "$GITHUB_OUTPUT"; echo "android=$(new android-v$v)" >> "$GITHUB_OUTPUT"; echo "apple=$(new tvos-v$v)" >> "$GITHUB_OUTPUT"; fi
           # Windows : jamais sans la clé, sinon l'appli installée refuserait la mise à jour.
@@ -179,6 +187,75 @@ jobs:
         if: always() && needs.version.outputs.essai == 'true'
         with:
           name: captures-${{ matrix.name }}
+          path: tv/captures
+
+  # Apple TV bêta : lecteur mpv (MPVKit) à la place de VLC, appli à part (« Meow Watch Bêta », identifiant .beta) pour
+  # garder l'officielle installée. Seulement à la demande (beta: true) ; avec essai: true, essai dans le simulateur
+  # (lecture d'un MKV de test, captures) au lieu de publier. Release « tvos-beta » remplacée à chaque fois.
+  apple-beta:
+    needs: version
+    if: needs.version.outputs.beta == 'true'
+    runs-on: macos-26
+    permissions:
+      contents: write
+    defaults:
+      run:
+        working-directory: tv
+    env:
+      EXPO_TV: "1"
+      MW_MPV: "1"
+      EXPO_PUBLIC_ESSAI_LECTEUR: ${{ inputs.essai && 'https://raw.githubusercontent.com/ietf-wg-cellar/matroska-test-files/master/test_files/test5.mkv' || '' }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          repository: VakzOs/MeowWatch
+          ref: ${{ env.REF }}
+          token: ${{ secrets.SOURCE_TOKEN }}
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+      - run: npm ci
+      - run: npx expo prebuild --platform ios --clean > /dev/null
+      - name: IPA sans signature
+        if: ${{ !inputs.essai }}
+        run: |
+          cd ios
+          xcodebuild -workspace MeowWatch.xcworkspace -scheme MeowWatch -configuration Release -sdk appletvos -destination generic/platform=tvOS \
+            -derivedDataPath build CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" -quiet build
+          mkdir Payload && cp -R build/Build/Products/Release-appletvos/MeowWatch.app Payload/
+          zip -qry ../Meow-Watch-AppleTV-Beta.ipa Payload
+      - name: Release tvos-beta
+        if: ${{ !inputs.essai }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          V: ${{ needs.version.outputs.version }}
+        run: |
+          n="Bêta du lecteur mpv, d'après la version $V ($(git rev-parse --short HEAD)). Fichier non signé, à signer avec Signulous : meowwatch.vkzdev.com/tv-beta.ipa."
+          gh release view tvos-beta --repo "$GITHUB_REPOSITORY" > /dev/null 2>&1 \
+            || gh release create tvos-beta --repo "$GITHUB_REPOSITORY" --prerelease --title "Meow Watch Bêta pour Apple TV (mpv)" --notes "$n"
+          gh release upload tvos-beta Meow-Watch-AppleTV-Beta.ipa --repo "$GITHUB_REPOSITORY" --clobber
+          gh release edit tvos-beta --repo "$GITHUB_REPOSITORY" --notes "$n"
+      - name: Essai dans le simulateur
+        if: ${{ inputs.essai }}
+        run: |
+          cd ios
+          xcodebuild -workspace MeowWatch.xcworkspace -scheme MeowWatch -configuration Release -sdk appletvsimulator -destination "generic/platform=tvOS Simulator" \
+            -derivedDataPath build CODE_SIGNING_ALLOWED=NO -quiet build
+          cd .. && mkdir -p captures
+          dev=$(xcrun simctl list devices available -j | jq -r '[.devices | to_entries[] | select(.key | test("tvOS")) | .value[] | select(.name | test("4K"))][-1].udid')
+          xcrun simctl boot "$dev"; xcrun simctl bootstatus "$dev"
+          open -a Simulator; sleep 5
+          xcrun simctl install "$dev" ios/build/Build/Products/Release-appletvsimulator/MeowWatch.app
+          shot() { xcrun simctl io "$dev" screenshot "captures/$1.png"; }
+          key() { osascript -e 'tell application "Simulator" to activate' -e "tell application \"System Events\" to key code $1" || true; sleep 2; }
+          xcrun simctl launch "$dev" com.vkzdev.meowwatch.tv.beta; sleep 3; shot accueil
+          for t in 15 30; do sleep 13; shot "lecture-${t}s"; done
+          key 36; shot commandes
+          xcrun simctl spawn "$dev" log show --last 3m --predicate 'process == "MeowWatch"' --style compact | grep -iE "error|exception|mpv" | tail -n 40 || true
+      - uses: actions/upload-artifact@v4
+        if: always() && inputs.essai
+        with:
+          name: captures-AppleTV-Beta
           path: tv/captures
 
   release-apple:
